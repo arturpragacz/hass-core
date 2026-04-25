@@ -66,6 +66,7 @@ from .typing import ConfigType, TemplateVarsType, VolDictType, VolSchemaType
 
 if TYPE_CHECKING:
     from .entity import Entity
+    from .entity_platform import EntityPlatform
 
 CONF_SERVICE_ENTITY_ID = "entity_id"
 
@@ -810,53 +811,80 @@ async def _resolve_entity_service_call_entities(
 
 
 async def _async_handle_entity_calls(
-    entity_calls: list[tuple[Entity, Coroutine[Any, Any, ServiceResponse]]],
+    single_calls: list[tuple[Entity, Coroutine[Any, Any, ServiceResponse]]],
+    batched_calls: list[
+        tuple[
+            EntityPlatform,
+            list[Entity],
+            Coroutine[Any, Any, EntityServiceResponse | None],
+        ]
+    ]
+    | None = None,
     *,
     context: Context,
 ) -> EntityServiceResponse:
     """Handle calls for entities."""
 
-    async def _with_context(
-        entity: Entity, coro: Coroutine[Any, Any, ServiceResponse]
-    ) -> ServiceResponse:
-        entity.async_set_context(context)
+    response_data: EntityServiceResponse = {}
+
+    async def _with_context[T](
+        entities: Iterable[Entity], coro: Coroutine[Any, Any, T]
+    ) -> T:
+        # Context can expire, so set it just before the call
+        # to avoid it getting stale.
+        for entity in entities:
+            entity.async_set_context(context)
         return await coro
 
-    if len(entity_calls) == 1:
-        # Single entity case avoids creating task
-        entity, coro = entity_calls[0]
-        single_result = await entity.async_request_call(_with_context(entity, coro))
-        if entity.should_poll:
-            # Context can expire, so set it again before we update
-            entity.async_set_context(context)
-            await entity.async_update_ha_state(True)
-        return {entity.entity_id: single_result}
+    async def _run_single(
+        entity: Entity, coro: Coroutine[Any, Any, ServiceResponse]
+    ) -> None:
+        response_data[entity.entity_id] = await entity.async_request_call(
+            _with_context((entity,), coro)
+        )
 
-    entities = [entity for entity, _ in entity_calls]
-    results: list[ServiceResponse | BaseException] = await asyncio.gather(
-        *[
-            entity.async_request_call(_with_context(entity, coro))
-            for entity, coro in entity_calls
-        ],
-        return_exceptions=True,
-    )
+    async def _run_batched(
+        platform: EntityPlatform,
+        entities: list[Entity],
+        coro: Coroutine[Any, Any, EntityServiceResponse | None],
+    ) -> None:
+        if platform.parallel_updates is not None:
+            async with platform.parallel_updates:
+                result = await _with_context(entities, coro)
+        else:
+            result = await _with_context(entities, coro)
+        if result is None:
+            for entity in entities:
+                response_data[entity.entity_id] = None
+        else:
+            response_data.update(result)
 
-    response_data: EntityServiceResponse = {}
-    for entity, result in zip(entities, results, strict=True):
-        if isinstance(result, BaseException):
-            raise result from None
-        response_data[entity.entity_id] = result
+    all_coros = [
+        *(_run_single(entity, coro) for entity, coro in single_calls),
+        *(
+            _run_batched(platform, entities, coro)
+            for platform, entities, coro in batched_calls or ()
+        ),
+    ]
 
-    tasks: list[asyncio.Task[None]] = []
-    for entity in entities:
+    if len(all_coros) == 1:
+        # Single coroutine case avoids creating a task
+        await all_coros[0]
+    else:
+        for result in await asyncio.gather(*all_coros, return_exceptions=True):
+            if isinstance(result, BaseException):
+                raise result from None
+
+    update_tasks: list[asyncio.Task[None]] = []
+    for entity, _ in single_calls:
         if not entity.should_poll:
             continue
         # Context can expire, so set it again before we update
         entity.async_set_context(context)
-        tasks.append(create_eager_task(entity.async_update_ha_state(True)))
+        update_tasks.append(create_eager_task(entity.async_update_ha_state(True)))
 
-    if tasks:
-        done, pending = await asyncio.wait(tasks)
+    if update_tasks:
+        done, pending = await asyncio.wait(update_tasks)
         assert not pending
         for future in done:
             future.result()
@@ -871,53 +899,86 @@ async def async_handle_entity_calls(
     context: Context,
 ) -> EntityServiceResponse:
     """Handle calls for multiple entities."""
-    return await _async_handle_entity_calls(
-        [
-            (
-                entity,
-                getattr(entity, func)(**data),
+    by_platform: dict[EntityPlatform, list[tuple[Entity, dict[str, Any]]]] = {}
+    single: list[tuple[Entity, Coroutine[Any, Any, ServiceResponse]]] = []
+    batched: list[
+        tuple[
+            EntityPlatform,
+            list[Entity],
+            Coroutine[Any, Any, EntityServiceResponse | None],
+        ]
+    ] = []
+
+    for entity, data in entity_data:
+        if entity.platform is None:
+            single.append((entity, getattr(entity, func)(**data)))
+            continue
+        by_platform.setdefault(entity.platform, []).append((entity, data))
+
+    for platform, items in by_platform.items():
+        batched_method = platform.async_get_batched_method(func)
+        if batched_method is not None:
+            assert platform.config_entry is not None
+            batched.append(
+                (
+                    platform,
+                    [entity for entity, _ in items],
+                    batched_method(platform.config_entry, items),
+                )
             )
-            for entity, data in entity_data
-        ],
-        context=context,
-    )
+        else:
+            single.extend(
+                (entity, getattr(entity, func)(**data)) for entity, data in items
+            )
+
+    return await _async_handle_entity_calls(single, batched, context=context)
 
 
-async def _handle_single_entity_call(
+async def _async_handle_legacy_entity_calls(
     hass: HomeAssistant,
-    entity: Entity,
+    entities: list[Entity],
     func: str | HassJob,
     data: dict | ServiceCall,
-) -> ServiceResponse:
-    """Handle calling service method."""
-    task: asyncio.Future[ServiceResponse] | None
-    if isinstance(func, str):
-        job = HassJob(
-            partial(getattr(entity, func), **data),  # type: ignore[arg-type]
-            job_type=entity.get_hassjob_type(func),
-        )
-        task = hass.async_run_hass_job(job)
-    else:
-        task = hass.async_run_hass_job(func, entity, data)
+    *,
+    context: Context,
+) -> EntityServiceResponse:
+    """Handle entity service calls through HassJob."""
 
-    # Guard because callback functions do not return a task when passed to
-    # async_run_job.
-    result: ServiceResponse = None
-    if task is not None:
-        result = await task
+    async def _call(entity: Entity) -> ServiceResponse:
+        task: asyncio.Future[ServiceResponse] | None
+        if isinstance(func, str):
+            job = HassJob(
+                partial(getattr(entity, func), **data),  # type: ignore[arg-type]
+                job_type=entity.get_hassjob_type(func),
+            )
+            task = hass.async_run_hass_job(job)
+        else:
+            task = hass.async_run_hass_job(func, entity, data)
 
-    if asyncio.iscoroutine(result):
-        _LOGGER.error(  # type: ignore[unreachable]
-            (
-                "Service %s for %s incorrectly returns a coroutine object. Await result"
-                " instead in service handler. Report bug to integration author"
-            ),
-            func,
-            entity.entity_id,
-        )
-        result = await result
+        # Guard because callback functions do not return a task when passed to
+        # async_run_job.
+        result: ServiceResponse = None
+        if task is not None:
+            result = await task
 
-    return result
+        if asyncio.iscoroutine(result):
+            _LOGGER.error(  # type: ignore[unreachable]
+                (
+                    "Service %s for %s incorrectly returns a coroutine object."
+                    " Await result instead in service handler. Report bug to"
+                    " integration author"
+                ),
+                func,
+                entity.entity_id,
+            )
+            result = await result
+
+        return result
+
+    return await _async_handle_entity_calls(
+        [(entity, _call(entity)) for entity in entities],
+        context=context,
+    )
 
 
 async def entity_service_call(
@@ -939,20 +1000,27 @@ async def entity_service_call(
     if entities is None:
         return None
 
-    # If the service function is a string, we'll pass it the service call data
     if isinstance(func, str):
-        data: dict | ServiceCall = remove_entity_service_fields(call)
-    # If the service function is not a string, we pass the service call
-    else:
-        data = call
-
-    response_data = await _async_handle_entity_calls(
-        [
-            (entity, _handle_single_entity_call(hass, entity, func, data))
+        # If the service function is a string, we'll pass it the service call data
+        data = remove_entity_service_fields(call)
+        if all(
+            entity.get_hassjob_type(func) is HassJobType.Coroutinefunction
             for entity in entities
-        ],
-        context=call.context,
-    )
+        ):
+            response_data = await async_handle_entity_calls(
+                func,
+                [(entity, data) for entity in entities],
+                context=call.context,
+            )
+        else:
+            response_data = await _async_handle_legacy_entity_calls(
+                hass, entities, func, data, context=call.context
+            )
+    else:
+        # If the service function is not a string, we pass the service call
+        response_data = await _async_handle_legacy_entity_calls(
+            hass, entities, func, call, context=call.context
+        )
 
     return response_data if call.return_response else None
 

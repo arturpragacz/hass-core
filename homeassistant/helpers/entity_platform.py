@@ -8,6 +8,7 @@ from logging import Logger, getLogger
 from typing import TYPE_CHECKING, Any, Protocol, overload
 
 from homeassistant import config_entries
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     ATTR_RESTORED,
     DEVICE_DEFAULT_NAME,
@@ -17,6 +18,7 @@ from homeassistant.core import (
     CALLBACK_TYPE,
     DOMAIN as HOMEASSISTANT_DOMAIN,
     CoreState,
+    EntityServiceResponse,
     HomeAssistant,
     ServiceCall,
     SupportsResponse,
@@ -192,6 +194,12 @@ class PlatformData:
             )
 
 
+type _BatchedEntityMethod = Callable[
+    [ConfigEntry, list[tuple[Any, dict[str, Any]]]],
+    Coroutine[Any, Any, EntityServiceResponse | None],
+]
+
+
 class EntityPlatform:
     """Manage the entities for a single platform.
 
@@ -232,6 +240,9 @@ class EntityPlatform:
 
         self.parallel_updates: asyncio.Semaphore | None = None
         self._update_in_sequence: bool = False
+
+        # Per-method batched handler overrides for entities on this platform.
+        self._batched_methods: dict[str, _BatchedEntityMethod] = {}
 
         # Platform is None for the EntityComponent "catch-all" EntityPlatform
         # which powers entity_component.add_entities
@@ -1109,6 +1120,39 @@ class EntityPlatform:
             supports_response=supports_response,
             description_placeholders=description_placeholders,
         )
+
+    @callback
+    def async_register_batched_method[EntityT](
+        self,
+        method_name: str,
+        func: Callable[
+            [ConfigEntry, list[tuple[EntityT, dict[str, Any]]]],
+            Coroutine[Any, Any, EntityServiceResponse | None],
+        ],
+    ) -> None:
+        """Register a batched method handler for entities on this platform.
+
+        A batched method handler will be called once per config entry with all
+        matching entities as a list, instead of once per entity.
+        The handler is responsible for refreshing entity state; `should_poll`
+        entities are not automatically polled after a batched call.
+        """
+        if self.config_entry is None:
+            raise RuntimeError(
+                f"Cannot register batched method {method_name!r}: "
+                f"platform {self.platform_name} has no config entry"
+            )
+        if method_name in self._batched_methods:
+            raise RuntimeError(
+                f"Batched method {method_name!r} is already registered "
+                f"on platform {self.platform_name}"
+            )
+        self._batched_methods[method_name] = func
+
+    @callback
+    def async_get_batched_method(self, method_name: str) -> _BatchedEntityMethod | None:
+        """Return the batched method handler registered for `method_name`."""
+        return self._batched_methods.get(method_name)
 
     async def _async_update_entity_states(self) -> None:
         """Update the states of all the polling entities.
